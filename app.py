@@ -252,9 +252,6 @@ def render_header() -> None:
                     <div class="brand-caption">AI code review for learners</div>
                 </div>
             </div>
-            <div class="nav-pills">
-                <span class="nav-pill active">Review</span>
-            </div>
         </header>
         """,
         unsafe_allow_html=True,
