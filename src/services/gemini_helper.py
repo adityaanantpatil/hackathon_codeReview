@@ -296,6 +296,220 @@ def _review_with_ollama(code: str, language: str, depth: str) -> dict[str, Any]:
     return data
 
 
+
+def _trim_text(text: str, max_chars: int = 12000) -> str:
+    """Keep prompts within a safe size while preserving the start and end."""
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    return text[:half] + "\n\n... [content trimmed for length] ...\n\n" + text[-half:]
+
+
+def _summarize_review_for_chat(review_data: dict[str, Any]) -> str:
+    """Compact review context for follow-up Q&A."""
+    if not isinstance(review_data, dict):
+        return "No review data available."
+
+    compact = {
+        "scores": review_data.get("scores", {}),
+        "overall_grade": review_data.get("overall_grade", "N/A"),
+        "summary": review_data.get("summary", ""),
+        "issues": review_data.get("issues", []),
+        "learning_tips": review_data.get("learning_tips", []),
+        "improved_code": review_data.get("improved_code", ""),
+    }
+    return _trim_text(json.dumps(compact, indent=2), max_chars=9000)
+
+
+def _build_chat_prompt(
+    *,
+    question: str,
+    code: str,
+    language: str,
+    review_data: dict[str, Any],
+    chat_history: list[dict[str, str]] | None = None,
+) -> str:
+    """Build a grounded follow-up prompt for the review chatbot."""
+    history_lines: list[str] = []
+    for message in (chat_history or [])[-8:]:
+        role = str(message.get("role", "user")).strip().title()
+        content = str(message.get("content", "")).strip()
+        if content:
+            history_lines.append(f"{role}: {content}")
+
+    history_text = "\n".join(history_lines) if history_lines else "No previous chat messages."
+
+    return f"""You are CodeBuddy Chat, a small assistant inside a code review app.
+Answer the student's follow-up question using the already-reviewed code and review results below.
+
+Rules:
+- Be concise, friendly, and beginner-friendly.
+- Ground your answer in the submitted code and review data.
+- If the question asks for a fix, provide the exact changed code snippet when useful.
+- Do not invent files, APIs, or behavior not visible from the provided code/review.
+- If the question is unrelated to the reviewed code, politely steer the user back to the code review.
+
+Programming language: {language}
+
+Submitted code:
+```{language.lower()}
+{_trim_text(code, max_chars=14000)}
+```
+
+Review result context:
+{_summarize_review_for_chat(review_data)}
+
+Recent chat history:
+{_trim_text(history_text, max_chars=5000)}
+
+Student question:
+{question}
+"""
+
+
+def _chat_with_gemini(
+    *,
+    question: str,
+    code: str,
+    language: str,
+    review_data: dict[str, Any],
+    chat_history: list[dict[str, str]] | None,
+    model: str,
+) -> dict[str, Any]:
+    client = get_client()
+    prompt = _build_chat_prompt(
+        question=question,
+        code=code,
+        language=language,
+        review_data=review_data,
+        chat_history=chat_history,
+    )
+
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.25,
+        ),
+    )
+
+    answer = (response.text or "").strip()
+    if not answer:
+        raise ValueError("The model returned an empty answer.")
+
+    return {"answer": answer, "_provider": "Gemini", "_model_used": model}
+
+
+def _chat_with_ollama(
+    *,
+    question: str,
+    code: str,
+    language: str,
+    review_data: dict[str, Any],
+    chat_history: list[dict[str, str]] | None,
+) -> dict[str, Any]:
+    model = get_ollama_model()
+    base_url = get_ollama_base_url()
+    prompt = _build_chat_prompt(
+        question=question,
+        code=code,
+        language=language,
+        review_data=review_data,
+        chat_history=chat_history,
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are CodeBuddy Chat, a concise programming tutor answering follow-up questions about a completed code review.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "options": {"temperature": 0.25},
+    }
+
+    request = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Ollama is not reachable at {base_url}. Start Ollama and pull the model: ollama pull {model}"
+        ) from exc
+
+    answer = str(result.get("message", {}).get("content", "")).strip()
+    if not answer:
+        raise ValueError("Ollama returned an empty answer.")
+
+    return {"answer": answer, "_provider": "Ollama", "_model_used": model}
+
+
+def ask_codebuddy_chat(
+    *,
+    question: str,
+    code: str,
+    language: str,
+    review_data: dict[str, Any],
+    chat_history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """
+    Answer follow-up questions after a review using the same AI backends.
+
+    Fallback order:
+      1. Gemini models from GEMINI_MODELS
+      2. Ollama local model if USE_OLLAMA_FALLBACK=true
+    """
+    errors: list[str] = []
+
+    if not question.strip():
+        return {"error": True, "message": "Please type a question first."}
+
+    if has_api_key():
+        for model in get_gemini_models():
+            try:
+                return _chat_with_gemini(
+                    question=question,
+                    code=code,
+                    language=language,
+                    review_data=review_data,
+                    chat_history=chat_history,
+                    model=model,
+                )
+            except Exception as exc:
+                errors.append(f"Gemini {model}: {str(exc)}")
+
+    if use_ollama_fallback():
+        try:
+            return _chat_with_ollama(
+                question=question,
+                code=code,
+                language=language,
+                review_data=review_data,
+                chat_history=chat_history,
+            )
+        except Exception as exc:
+            errors.append(f"Ollama {get_ollama_model()}: {str(exc)}")
+
+    if not errors:
+        errors.append(
+            "No AI backend configured. Add GEMINI_API_KEY to .env or enable Ollama fallback."
+        )
+
+    return {
+        "error": True,
+        "message": "All chatbot backends failed. " + " | ".join(errors[-3:]),
+    }
+
 def get_code_review(code: str, language: str, depth: str = "Standard") -> Dict[str, Any]:
     """
     Get AI-powered code review.

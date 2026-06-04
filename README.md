@@ -14,6 +14,7 @@ CodeReview AI is a web app where students paste or upload their code and receive
 🐛 Issue cards — line-level comments with severity (Critical / Warning / Suggestion)
 ✨ Improved Code — AI-rewritten version of your code
 📘 Learning Tips — personalized suggestions based on your code
+💬 Ask CodeBuddy chatbot — appears after review and answers follow-up questions about the reviewed code using the same AI backend
 📄 PDF Report — downloadable full review report via FPDF
 🎨 Cyberpunk dark UI — interactive, terminal-inspired design
 
@@ -50,6 +51,7 @@ streamlit run app.py
 Your code is sent to Gemini 1.5 Flash with a structured prompt
 Gemini returns a JSON response with scores, issues, improved code, and tips
 The app parses and displays it across 4 interactive tabs
+After the review appears, the **Ask CodeBuddy** chatbot window becomes available so students can ask follow-up questions like “Why is this bug happening?” or “Show me the corrected snippet.”
 Optionally, you can download a PDF report of the full review
 
 Review depth options:
@@ -83,6 +85,7 @@ This is the main Streamlit application. It controls the complete website flow:
 - shows the hero section, language selector, review depth selector, upload option, and code editor
 - sends the submitted code to Gemini through `gemini_helper.py`
 - displays scorecards, issues, improved code, learning tips, and summary
+- shows the small **Ask CodeBuddy** chatbot window after the review is generated
 - creates the PDF download button
 - creates the Google Drive upload button
 - manages Streamlit session state so the result stays visible after analysis
@@ -95,7 +98,7 @@ This file controls the visual design of the Streamlit website.
 It helps by:
 
 - giving the app a clean CodeBuddy-style frontend
-- styling the background, cards, buttons, editor box, scorecards, issue cards, and Drive status boxes
+- styling the background, cards, buttons, editor box, scorecards, issue cards, chatbot window, and Drive status boxes
 - making the UI look more polished than default Streamlit
 - keeping the frontend stack simple because no JavaScript is used
 
@@ -111,6 +114,7 @@ It helps by:
 - sending the student's code, language, and review depth to Gemini
 - requesting a structured JSON response
 - returning scores, issues, improved code, learning tips, and summary back to `app.py`
+- answering chatbot follow-up questions after a review using the same Gemini/Ollama backend logic
 
 This keeps AI-related logic separate from the website UI.
 

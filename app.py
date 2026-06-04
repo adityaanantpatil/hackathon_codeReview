@@ -12,12 +12,13 @@ from __future__ import annotations
 
 from datetime import datetime
 from html import escape
+import hashlib
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
-from src.services.gemini_helper import get_code_review, has_api_key, has_any_ai_backend
+from src.services.gemini_helper import ask_codebuddy_chat, get_code_review, has_api_key, has_any_ai_backend
 from src.services.pdf_report import generate_pdf_report
 from src.services.drive_uploader import is_drive_configured, save_review_to_drive
 
@@ -138,13 +139,26 @@ def init_state() -> None:
         "analyzed": False,
         "selected_language": "Python",
         "selected_depth": "Standard",
+        "last_uploaded_signature": None,
         "pdf_bytes_cache": None,
         "pdf_cache_signature": None,
         "drive_upload_result": None,
         "drive_folder_link": "",
+        "chatbot_messages": [],
+        "chatbot_busy": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+
+    language_options = [language_label(language) for language in SUPPORTED_LANGUAGES]
+    current_language = st.session_state.get("selected_language", "Python")
+    if current_language not in SUPPORTED_LANGUAGES:
+        current_language = "Python"
+        st.session_state.selected_language = current_language
+
+    current_label = st.session_state.get("language_picker", language_label(current_language))
+    if current_label not in language_options:
+        st.session_state.language_picker = language_label(current_language)
 
 
 def reset_review(keep_code: bool = True) -> None:
@@ -154,14 +168,37 @@ def reset_review(keep_code: bool = True) -> None:
     st.session_state.pdf_bytes_cache = None
     st.session_state.pdf_cache_signature = None
     st.session_state.drive_upload_result = None
+    st.session_state.chatbot_messages = []
+    st.session_state.chatbot_busy = False
     if not keep_code:
         st.session_state.editor_code = ""
 
 
 def load_example(language: str, code: str) -> None:
-    """Load one of the example snippets into the editor."""
-    st.session_state.selected_language = language
+    """Load one of the example snippets into the editor and sync the language picker."""
+    set_selected_language(language)
     st.session_state.editor_code = code
+    reset_review(keep_code=True)
+
+
+def handle_clear() -> None:
+    """Clear editor and previous review output safely before widgets are rebuilt."""
+    st.session_state.editor_code = ""
+    st.session_state.last_uploaded_signature = None
+    reset_review(keep_code=True)
+
+
+def handle_review_another() -> None:
+    """Clear the current review and editor for another submission."""
+    st.session_state.last_uploaded_signature = None
+    reset_review(keep_code=False)
+
+
+def handle_reset_to_sample() -> None:
+    """Restore the default Python sample."""
+    set_selected_language("Python")
+    st.session_state.editor_code = DEFAULT_CODE
+    st.session_state.last_uploaded_signature = None
     reset_review(keep_code=True)
 
 
@@ -174,6 +211,23 @@ def language_from_label(label: str) -> str:
         if label.endswith(language):
             return language
     return "Python"
+
+
+def set_selected_language(language: str) -> None:
+    """Keep the internal language and Streamlit selectbox state in sync."""
+    if language not in SUPPORTED_LANGUAGES:
+        language = "Python"
+    st.session_state.selected_language = language
+    st.session_state.language_picker = language_label(language)
+
+
+def detect_language_from_filename(filename: str) -> str | None:
+    """Infer the editor language from an uploaded source-code filename."""
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    for language, extensions in FILE_TYPES.items():
+        if suffix in extensions:
+            return language
+    return None
 
 
 def render_background() -> None:
@@ -382,6 +436,24 @@ def render_example_card(language: str, title: str, description: str) -> None:
     )
 
 
+def render_chat_message(role: str, content: str) -> None:
+    """Render one message inside the small chatbot window."""
+    role = "assistant" if role == "assistant" else "user"
+    label = "CodeBuddy" if role == "assistant" else "You"
+    bubble_class = "bot-bubble" if role == "assistant" else "user-bubble"
+    st.markdown(
+        f"""
+        <div class="chat-row {role}">
+            <div class="chat-bubble {bubble_class}">
+                <div class="chat-label">{escape(label)}</div>
+                <div class="chat-text">{escape(content).replace(chr(10), '<br>')}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def get_cached_pdf_report(code: str, language: str, review_data: dict) -> bytes:
     """Generate the PDF once and keep it in session state."""
     signature = f"{language}|{len(code)}|{review_data.get('overall_grade', '')}|{review_data.get('summary', '')}"
@@ -423,11 +495,53 @@ open_editor_card("Code review workspace")
 
 control_col_1, control_col_2, control_col_3 = st.columns([1.1, 1.1, 1.4])
 
+# Render uploader first so an uploaded file can update the language picker before
+# the selectbox widget is created in this run. This keeps upload + language sync reliable.
+with control_col_3:
+    uploaded_file = st.file_uploader(
+        "Upload a file",
+        type=ALL_UPLOAD_TYPES,
+        help="Supported: .py, .js, .java, .cpp, .cc, .cxx, .hpp, .h",
+        label_visibility="visible",
+        key="source_uploader",
+    )
+
+if uploaded_file is not None:
+    try:
+        uploaded_bytes = uploaded_file.getvalue()
+        upload_signature = (
+            f"{uploaded_file.name}:{len(uploaded_bytes)}:"
+            f"{hashlib.sha1(uploaded_bytes).hexdigest()}"
+        )
+
+        # Only load a newly uploaded/changed file once. This prevents Streamlit
+        # from overwriting user edits on every rerun while the uploaded file remains attached.
+        if st.session_state.get("last_uploaded_signature") != upload_signature:
+            st.session_state.editor_code = uploaded_bytes.decode("utf-8")
+            st.session_state.last_uploaded_signature = upload_signature
+
+            detected_language = detect_language_from_filename(uploaded_file.name)
+            if detected_language:
+                set_selected_language(detected_language)
+
+            reset_review(keep_code=True)
+    except UnicodeDecodeError:
+        st.error("This file could not be decoded as UTF-8 text. Please upload a plain source-code file.")
+
 with control_col_1:
+    language_options = [language_label(language) for language in SUPPORTED_LANGUAGES]
+    current_label = st.session_state.get(
+        "language_picker",
+        language_label(st.session_state.get("selected_language", "Python")),
+    )
+    if current_label not in language_options:
+        current_label = language_label("Python")
+        st.session_state.language_picker = current_label
+
     selected_label = st.selectbox(
         "Language",
-        [language_label(language) for language in SUPPORTED_LANGUAGES],
-        index=SUPPORTED_LANGUAGES.index(st.session_state.selected_language),
+        language_options,
+        index=language_options.index(current_label),
         key="language_picker",
     )
     st.session_state.selected_language = language_from_label(selected_label)
@@ -439,25 +553,6 @@ with control_col_2:
         index=REVIEW_DEPTHS.index(st.session_state.selected_depth),
         key="depth_picker",
     )
-
-with control_col_3:
-    uploaded_file = st.file_uploader(
-        "Upload a file",
-        type=ALL_UPLOAD_TYPES,
-        help="Supported: .py, .js, .java, .cpp, .cc, .cxx, .hpp, .h",
-        label_visibility="visible",
-    )
-
-if uploaded_file is not None:
-    try:
-        st.session_state.editor_code = uploaded_file.read().decode("utf-8")
-        suffix = uploaded_file.name.rsplit(".", 1)[-1].lower()
-        for language, extensions in FILE_TYPES.items():
-            if suffix in extensions:
-                st.session_state.selected_language = language
-                break
-    except UnicodeDecodeError:
-        st.error("This file could not be decoded as UTF-8 text. Please upload a plain source-code file.")
 
 st.markdown("<div class='editor-help'>Paste your code in the editor below, or upload a source file above.</div>", unsafe_allow_html=True)
 code_input = st.text_area(
@@ -472,16 +567,11 @@ button_col_1, button_col_2, button_col_3 = st.columns([1.2, 1.0, 2.4])
 with button_col_1:
     analyze_button = st.button("Review My Code", type="primary", use_container_width=True)
 with button_col_2:
-    clear_button = st.button("Clear", use_container_width=True)
+    st.button("Clear", use_container_width=True, on_click=handle_clear)
 with button_col_3:
     st.empty()
 
 close_editor_card()
-
-if clear_button:
-    st.session_state.editor_code = ""
-    reset_review(keep_code=True)
-    st.rerun()
 
 if analyze_button:
     if not code_input.strip():
@@ -507,6 +597,8 @@ if analyze_button:
             st.session_state.pdf_bytes_cache = None
             st.session_state.pdf_cache_signature = None
             st.session_state.drive_upload_result = None
+            st.session_state.chatbot_messages = []
+            st.session_state.chatbot_busy = False
             if review_data.get("overall_grade") in {"A+", "A"}:
                 st.balloons()
             st.rerun()
@@ -622,7 +714,7 @@ if st.session_state.analyzed and st.session_state.review_data:
 
     if not is_drive_configured():
         st.markdown(
-            "<div class='drive-status drive-warning'>☁️ Google Drive API is not configured yet. A folder link alone is not enough. Add <strong>credential.json</strong> beside <strong>app.py</strong>, then run <code>python src/services/drive_uploader.py --setup</code>.</div>",
+            "<div class='drive-status drive-warning'>☁️ Google Drive API is not configured yet. A folder link alone is not enough. Add <strong>credentials.json</strong> beside <strong>app.py</strong>, then run <code>python src/services/drive_uploader.py --setup</code>.</div>",
             unsafe_allow_html=True,
         )
     else:
@@ -663,15 +755,76 @@ if st.session_state.analyzed and st.session_state.review_data:
             st.rerun()
 
     with action_col_3:
-        if st.button("Review Another", use_container_width=True):
-            reset_review(keep_code=True)
-            st.rerun()
+        st.button("Review Another", use_container_width=True, on_click=handle_review_another)
 
     with action_col_4:
-        if st.button("Reset to Sample", use_container_width=True):
-            st.session_state.editor_code = DEFAULT_CODE
-            reset_review(keep_code=True)
-            st.rerun()
+        st.button("Reset to Sample", use_container_width=True, on_click=handle_reset_to_sample)
+
+    st.markdown(
+        """
+        <div class="chatbot-window">
+            <div class="chatbot-header">
+                <div>
+                    <div class="chatbot-title">🤖 Ask CodeBuddy</div>
+                    <div class="chatbot-subtitle">Appears after review · uses the same AI backend</div>
+                </div>
+                <span class="chatbot-status">Online</span>
+            </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not st.session_state.chatbot_messages:
+        render_chat_message(
+            "assistant",
+            "Your review is ready. Ask me things like: Why is this line wrong? How do I fix the first issue? Can you explain the improved code?",
+        )
+    else:
+        for message in st.session_state.chatbot_messages:
+            render_chat_message(message.get("role", "assistant"), message.get("content", ""))
+
+    with st.form("codebuddy_chat_form", clear_on_submit=True):
+        question = st.text_input(
+            "Ask a question about this review",
+            placeholder="Example: Explain the most important bug and show the corrected snippet",
+            label_visibility="collapsed",
+        )
+        chat_col_1, chat_col_2 = st.columns([1.3, 0.7])
+        with chat_col_1:
+            ask_button = st.form_submit_button("Ask CodeBuddy", type="primary", use_container_width=True)
+        with chat_col_2:
+            clear_chat_button = st.form_submit_button("Clear Chat", use_container_width=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if clear_chat_button:
+        st.session_state.chatbot_messages = []
+        st.rerun()
+
+    if ask_button:
+        if not question.strip():
+            st.warning("Please type a question for CodeBuddy first.")
+        elif not has_any_ai_backend():
+            st.error("No AI backend is configured. Add GEMINI_API_KEY to .env or enable Ollama fallback.")
+        else:
+            existing_messages = list(st.session_state.chatbot_messages)
+            with st.spinner("CodeBuddy is thinking…"):
+                chat_response = ask_codebuddy_chat(
+                    question=question,
+                    code=st.session_state.editor_code,
+                    language=st.session_state.selected_language,
+                    review_data=review_data,
+                    chat_history=existing_messages,
+                )
+
+            if chat_response.get("error"):
+                st.error(chat_response.get("message", "CodeBuddy could not answer right now."))
+            else:
+                st.session_state.chatbot_messages = existing_messages + [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": chat_response.get("answer", "")},
+                ]
+                st.rerun()
 
     st.markdown("</section>", unsafe_allow_html=True)
 
@@ -702,6 +855,6 @@ for col, (language, example) in zip(example_cols, EXAMPLES.items()):
         )
 
 st.markdown(
-    "<div class='footer-note'>Built with Streamlit + CSS · Powered by Gemini · CodeBuddy © 2026</div>",
+    "<div class='footer-note'>CodeBuddy © 2026</div>",
     unsafe_allow_html=True,
 )
