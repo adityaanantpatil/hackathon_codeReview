@@ -387,3 +387,5 @@ OLLAMA_MODEL=codellama:7b
 - Ollama quality depends on the model you pull.
 - Gemini output is usually more consistent for structured JSON.
 - Ollama is useful as a backup when Gemini has quota or high-demand errors.
+#   i n t e l l i a i - a r e n a - 2 0 2 6 - c h a m p s - w i n n e r  
+ 
